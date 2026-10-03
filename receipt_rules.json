@@ -1,0 +1,90 @@
+{
+  "paths": {
+    "receipts_folder": "client_receipts",
+    "output_csv": "monthly_expense_report.csv"
+  },
+  "output_fields": [
+    "File Name",
+    "Vendor/Bill Name",
+    "Primary Date",
+    "All Dates Found",
+    "Total Amount",
+    "Confidence Score",
+    "Evidence",
+    "Status"
+  ],
+  "patterns": {
+    "currency": "(?:\\u20B9|rs\\.?|inr)",
+    "amount": "(?<![\\w.])(?:(?:\\u20B9|rs\\.?|inr)\\s*)?(-?\\d{1,3}(?:,\\d{3})+(?:\\.\\d{1,2})?|-?\\d+(?:\\.\\d{1,2})?)(?![\\w.])",
+    "date": "\\b(?:\\d{1,2}[/-](?:\\d{1,2}|[A-Za-z]{3,9})[/-]\\d{2,4}|\\d{4}[/-]\\d{1,2}[/-]\\d{1,2}|\\d{1,2}[ \\t]+[A-Za-z]{3,9}[ \\t]+\\d{2,4})\\b",
+    "phone": "(?:\\+?91[-\\s]?)?\\d{10}\\b",
+    "standalone_amount": "(?:\\u20B9|rs\\.?|inr)?\\s*-?[\\d,]+(?:\\.\\d{1,2})?"
+  },
+  "extraction": {
+    "ocr": {
+      "enabled": true,
+      "resolution": 300,
+      "min_text_characters": 20
+    },
+    "amount": {
+      "max_abs_amount": 1000000,
+      "year_range": [1900, 2100],
+      "long_number_digits": 7
+    },
+    "context": {
+      "nearby_lines": 2,
+      "section_end_ratio": 0.7
+    }
+  },
+  "hints": {
+    "total": ["total", "payable", "paid", "due", "settlement", "charged"],
+    "amount": ["amount", "invoice", "bill", "payment", "balance", "value"],
+    "combined_total": ["payable", "due", "amount", "balance"],
+    "non_final": ["item", "subtotal", "tax", "gst", "discount", "coupon", "saving", "delivery", "handling", "packing", "platform", "quantity", "qty", "mrp", "previous"],
+    "identifier": ["order id", "invoice no", "invoice number", "account no", "account number", "gstin", "pan", "hsn", "sac", "phone", "mobile", "telephone", "contact number", "pincode"],
+    "date_labels": ["date of invoice", "invoice date", "order date", "bill date", "statement date"],
+    "seller_labels": ["seller name", "merchant", "vendor", "billed by"],
+    "ignored_headings": ["tax invoice", "invoice", "receipt"]
+  },
+  "scoring": {
+    "currency_marker": 18,
+    "decimal_money_format": 12,
+    "thousands_separator": 4,
+    "total_wording": 30,
+    "combined_total_wording": 10,
+    "payment_wording": 18,
+    "nearby_total_wording": 14,
+    "amount_wording": 12,
+    "non_final_context": -38,
+    "identifier_context": -75,
+    "date_context": -75,
+    "phone_context": -90,
+    "negative_amount": -15,
+    "year_like_integer": -25,
+    "long_unformatted_number": -30,
+    "repeat_amount": 4,
+    "maximum_repeat_bonus": 12,
+    "section_end": 5
+  },
+  "thresholds": {
+    "confirmed": 70,
+    "review": 40
+  },
+  "vendor_rules": [
+    {
+      "name": "Instamart final table cell",
+      "required_text": ["invoice value"],
+      "look_ahead_lines": 3,
+      "strategy": "next_standalone_amount",
+      "score": 100,
+      "status": "Confirmed",
+      "fallback": {
+        "strategy": "base_plus_following_amount",
+        "following_text": "handling fee",
+        "look_ahead_lines": 2,
+        "score": 80,
+        "status": "Review calculated total"
+      }
+    }
+  ]
+}
