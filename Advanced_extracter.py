@@ -1,70 +1,31 @@
 import csv
-import json
 import re
-import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-
-import pdfplumber
-
-
-SCRIPT_DIR = Path(__file__).resolve().parent
-RULES_FILE = SCRIPT_DIR / "receipt_rules.json"
-
-
-def load_rules():
-    try:
-        with RULES_FILE.open(encoding="utf-8") as rules_file:
-            rules = json.load(rules_file)
-    except FileNotFoundError as error:
-        raise RuntimeError(f"Missing configuration file: {RULES_FILE}") from error
-    except json.JSONDecodeError as error:
-        raise RuntimeError(f"Invalid JSON in {RULES_FILE}: {error.msg} at line {error.lineno}") from error
-
-    required_sections = {
-        "paths": dict,
-        "output_fields": list,
-        "patterns": dict,
-        "extraction": dict,
-        "hints": dict,
-        "scoring": dict,
-        "thresholds": dict,
-        "vendor_rules": list,
-    }
-    for name, expected_type in required_sections.items():
-        if not isinstance(rules.get(name), expected_type):
-            raise RuntimeError(f"receipt_rules.json needs a '{name}' {expected_type.__name__}")
-
-    required_patterns = {"currency", "amount", "date", "phone", "standalone_amount"}
-    missing_patterns = required_patterns - set(rules["patterns"])
-    if missing_patterns:
-        raise RuntimeError(f"receipt_rules.json is missing patterns: {', '.join(sorted(missing_patterns))}")
-    if len(rules["output_fields"]) != 8:
-        raise RuntimeError("receipt_rules.json needs exactly 8 output_fields")
-    return rules
-
-
-RULES = load_rules()
-PATHS = RULES["paths"]
-FIELDS = RULES["output_fields"]
-PATTERNS = RULES["patterns"]
-EXTRACTION = RULES["extraction"]
-AMOUNT_SETTINGS = EXTRACTION["amount"]
-CONTEXT_SETTINGS = EXTRACTION["context"]
-OCR_SETTINGS = EXTRACTION["ocr"]
-HINTS = RULES["hints"]
-SCORES = RULES["scoring"]
-THRESHOLDS = RULES["thresholds"]
-VENDOR_RULES = RULES["vendor_rules"]
-PDF_FOLDER = SCRIPT_DIR / PATHS["receipts_folder"]
-OUTPUT_CSV = SCRIPT_DIR / PATHS["output_csv"]
+from extraction import extract_pages
+from config import (
+    RULES,
+    PATHS,
+    FIELDS,
+    PATTERNS,
+    AMOUNT_SETTINGS,
+    CONTEXT_SETTINGS,
+    OCR_SETTINGS,
+    HINTS,
+    SCORES,
+    THRESHOLDS,
+    VENDOR_RULES,
+    PDF_FOLDER,
+    OUTPUT_CSV,
+)
 
 CURRENCY_RE = re.compile(PATTERNS["currency"], re.IGNORECASE)
 AMOUNT_RE = re.compile(PATTERNS["amount"], re.IGNORECASE)
 DATE_RE = re.compile(PATTERNS["date"])
 PHONE_RE = re.compile(PATTERNS["phone"])
 STANDALONE_AMOUNT_RE = re.compile(PATTERNS["standalone_amount"], re.IGNORECASE)
+INVOICE_NUMBER_RE = re.compile(PATTERNS["invoice_number"], re.IGNORECASE)
 
 
 @dataclass
@@ -78,43 +39,6 @@ class AmountCandidate:
     has_decimal: bool
     score: int = 0
     evidence: list[str] = field(default_factory=list)
-
-
-def normalise_text(text):
-    return unicodedata.normalize("NFKC", text).replace("\xa0", " ")
-
-
-def ocr_page(page):
-    """Use OCR only when it is enabled in receipt_rules.json and available."""
-    if not OCR_SETTINGS["enabled"]:
-        return None
-    try:
-        import pytesseract
-
-        image = page.to_image(resolution=OCR_SETTINGS["resolution"]).original
-        return normalise_text(pytesseract.image_to_string(image))
-    except Exception:
-        return None
-
-
-def extract_pages(file_path):
-    """Extract page-by-page text so candidates retain their local context."""
-    pages = []
-    ocr_used = False
-    ocr_available = None
-
-    with pdfplumber.open(file_path) as pdf:
-        for page in pdf.pages:
-            text = normalise_text(page.extract_text() or page.extract_text(layout=True) or "")
-            if len(re.sub(r"\s+", "", text)) < OCR_SETTINGS["min_text_characters"]:
-                ocr_text = ocr_page(page)
-                ocr_available = ocr_text is not None
-                if ocr_text and len(ocr_text.strip()) > len(text.strip()):
-                    text = ocr_text
-                    ocr_used = True
-            pages.append([line.strip() for line in text.splitlines() if line.strip()])
-
-    return pages, ocr_used, ocr_available
 
 
 def format_amount(amount):
@@ -278,6 +202,53 @@ def extract_vendor(page_lines):
             return line[:60]
     return "Unknown Vendor"
 
+def extract_invoice_number(page_lines):
+    invoice_pattern = re.compile(
+        r"\b(?:invoice|inv|bill|receipt)"
+        r"\s*(?:no\.?|number|#)"
+        r"\s*[:\-]?\s*"
+        r"([A-Z0-9][A-Z0-9./_-]{2,})\b",
+        re.IGNORECASE
+    )
+
+    order_pattern = re.compile(
+        r"\b(?:order|transaction)"
+        r"\s*(?:id|no\.?|number|#)"
+        r"\s*[:\-]?\s*"
+        r"([A-Z0-9][A-Z0-9./_-]{2,})\b",
+        re.IGNORECASE
+    )
+
+    # Priority 1: Invoice / Bill / Receipt
+    for page in page_lines:
+        for line in page:
+            match = invoice_pattern.search(line)
+            if match:
+                value = match.group(1).strip()
+
+                # Reject obvious non-identifiers
+                if value.casefold() not in {
+                    "amount",
+                    "number",
+                    "invoice",
+                    "bill",
+                    "receipt",
+                    "date",
+                    "total",
+                    "paid",
+                    "due",
+                    "balance",
+                }:
+                    return value
+
+    # Priority 2: Order / Transaction ID
+    for page in page_lines:
+        for line in page:
+            match = order_pattern.search(line)
+            if match:
+                return match.group(1).strip()
+
+    return "Not Found"
 
 def extract_dates(page_lines):
     text = "\n".join(line for page in page_lines for line in page)
@@ -298,11 +269,12 @@ def process_file(file_path):
         status = "Scanned PDF: install pytesseract and Tesseract OCR" if ocr_available is False else "Scanned PDF / Empty"
         return [file_path.name, "Unknown Vendor", "Not Found", "Not Found", "Not Found", 0, "No text extracted", status]
 
+    invoice_number = extract_invoice_number(page_lines)
     primary_date, all_dates = extract_dates(page_lines)
     amount, score, evidence, status = extract_total(page_lines)
     if ocr_used:
         status = f"{status}; OCR used"
-    return [file_path.name, extract_vendor(page_lines), primary_date, all_dates, amount, score, evidence, status]
+    return [file_path.name, extract_vendor(page_lines), invoice_number, primary_date, all_dates, amount, score, evidence, status]
 
 
 def main():
@@ -314,9 +286,9 @@ def main():
             try:
                 row = process_file(file_path)
             except Exception as error:
-                row = [file_path.name, "Not Found", "Not Found", "Not Found", "Not Found", 0, "Error", str(error)]
+                row = [file_path.name, "Not Found", "Not Found", "Not Found", "Not Found", "Not Found", 0, "Error", str(error)]
             writer.writerow(row)
-            print(f"Extracted: {file_path.name} -> Total: {row[4]} ({row[7]})")
+            print(f"Extracted: {file_path.name} -> Total: {row[5]} ({row[8]})")
     print(f"Script complete. Open '{OUTPUT_CSV}' to see the results.")
 
 
